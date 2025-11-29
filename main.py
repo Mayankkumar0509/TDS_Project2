@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import asyncio
 
+from config import QUIZ_SECRET
 from solver import QuizSolver
 
 # Setup logging
@@ -35,8 +36,7 @@ async def solve(request: SolveRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Missing required fields: email, secret, url")
     
     # Verify secret
-    quiz_secret = os.getenv("QUIZ_SECRET", "")
-    if request.secret != quiz_secret:
+    if request.secret != QUIZ_SECRET:
         logger.warning(f"[{request_id}] Invalid secret provided")
         raise HTTPException(status_code=403, detail="Invalid secret")
     
