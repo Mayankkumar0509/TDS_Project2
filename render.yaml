@@ -2,24 +2,73 @@ services:
   - type: web
     name: llm-quiz-solver
     env: docker
-    region: oregon  # Choose: oregon, frankfurt, singapore
-    plan: free  # Or: starter, standard, pro
+    # Choose region closest to you: oregon, frankfurt, singapore, ohio
+    region: oregon
+    # Free tier for testing, upgrade for production
+    # Options: free, starter ($7/mo), standard ($25/mo), pro ($85/mo)
+    plan: free
+    # Path to Dockerfile
     dockerfilePath: ./Dockerfile
+    # Branch to deploy from
+    branch: main
+    # Auto-deploy on every push
+    autoDeploy: true
+    # Health check endpoint
+    healthCheckPath: /health
+    # Environment variables
     envVars:
+      # Secret - Set this manually in Render Dashboard (DO NOT commit actual value)
       - key: QUIZ_SECRET
-        sync: false  # Set manually in Render dashboard
+        sync: false
+      
+      # LLM Configuration
       - key: AIML_BASE_URL
         value: https://aipipe.org/openai/v1
+      
       - key: AIML_MODEL
         value: gpt-4o-mini
+      
+      # API Key - Set this manually in Render Dashboard (DO NOT commit actual value)
       - key: AIML_API_KEY
-        sync: false  # Set manually in Render dashboard
+        sync: false
+      
+      # Application Configuration
       - key: MAX_FILE_SIZE_MB
         value: 5
+      
       - key: TIMEOUT_SECONDS
         value: 180
+      
       - key: LOG_LEVEL
         value: INFO
+      
+      # Port (Render uses 10000 by default)
       - key: PORT
         value: 10000
-    healthCheckPath: /health
+      
+      # Python environment
+      - key: PYTHONUNBUFFERED
+        value: 1
+      
+      - key: PYTHONDONTWRITEBYTECODE
+        value: 1
+    
+    # Build settings
+    buildFilter:
+      paths:
+        - main.py
+        - solver.py
+        - llm_helper.py
+        - config.py
+        - requirements.txt
+        - Dockerfile
+      ignoredPaths:
+        - "*.md"
+        - docs/**
+        - tests/**
+    
+    # Disk storage (optional, for persistent logs)
+    # disk:
+    #   name: quiz-solver-logs
+    #   mountPath: /app/logs
+    #   sizeGB: 1
