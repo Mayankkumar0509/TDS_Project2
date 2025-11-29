@@ -7,24 +7,43 @@ RUN apt-get update && apt-get install -y \
     libmagic1 \
     libpoppler-cpp-dev \
     tesseract-ocr \
-    chromium-browser \
+    # Playwright dependencies
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
+# Copy requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers
-RUN playwright install
+# Install Playwright browsers (use --with-deps for all dependencies)
+RUN playwright install --with-deps chromium
 
-# Copy app
+# Copy application code
 COPY . .
 
 # Create necessary directories
 RUN mkdir -p logs temp
 
-# Expose port
-EXPOSE 8000
+# Render uses PORT environment variable
+ENV PORT=10000
 
-# Run app
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Expose the port
+EXPOSE 10000
+
+# Run the application - MUST bind to 0.0.0.0 and use PORT env var
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT}
