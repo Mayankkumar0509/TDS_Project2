@@ -1,217 +1,100 @@
-import re
-import json
 import logging
-from typing import Optional, Dict, Any
-import asyncio
-
-from config import AIML_API_KEY, AIML_BASE_URL, AIML_MODEL
+import json
+import re
+import os
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 
 class LLMHelper:
-    """Wrapper for AIML LLM calls with heuristic fallbacks."""
-    
     def __init__(self):
-        self.api_key = AIML_API_KEY
-        self.base_url = AIML_BASE_URL
-        self.model = AIML_MODEL
+        self.api_key = os.getenv("OPENAI_API_KEY", "")
         self.use_llm = bool(self.api_key)
-        
+    
+    async def compute_answer(self, instructions: str, file_contents: Dict[str, str], page_html: str = "", retry: bool = False) -> str:
+        """
+        Compute answer using LLM if available, otherwise use heuristics.
+        Answer can be: boolean, number, string, base64 URI, or JSON object.
+        """
         if self.use_llm:
-            try:
-                from openai import AsyncOpenAI
-                self.client = AsyncOpenAI(
-                    api_key=self.api_key,
-                    base_url=self.base_url
+            return await self._call_llm(instructions, file_contents, page_html, retry)
+        else:
+            return self._heuristic_answer(instructions, file_contents, page_html, retry)
+    
+    async def _call_llm(self, instructions: str, file_contents: Dict[str, str], page_html: str = "", retry: bool = False) -> str:
+        """Call OpenAI API - may return number, string, boolean, or JSON."""
+        try:
+            import httpx
+            
+            context = f"Instructions: {instructions}\n\n"
+            for filename, content in file_contents.items():
+                context += f"File: {filename}\n{content}\n\n"
+            
+            if page_html:
+                context += f"Page HTML:\n{page_html[:1500]}\n\n"
+            
+            system_msg = "You are a data analysis and web scraping expert. Extract the answer as a single value (number, string, boolean, or JSON object). Return ONLY the answer, no explanation."
+            if retry:
+                system_msg += " This is a retry - the previous answer was wrong. Try a different approach."
+            
+            payload = {
+                "model": "gpt-4-mini",
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": context}
+                ],
+                "temperature": 0.3 if not retry else 0.7,  # Lower temp for first try, higher for retry
+                "max_tokens": 500
+            }
+            
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=30
                 )
-                logger.info(f"✅ AIML LLM initialized: {self.model} at {self.base_url}")
-            except Exception as e:
-                logger.error(f"Failed to initialize AIML client: {e}")
-                self.use_llm = False
-        else:
-            logger.warning("⚠️ AIML_API_KEY not set. Using heuristic fallbacks.")
-    
-    async def analyze_task(self, task_text: str, context: str = "") -> Dict[str, Any]:
-        """
-        Analyze task instructions and extract key requirements.
-        
-        Args:
-            task_text: The task instruction text
-            context: Additional context (data preview, etc.)
-        
-        Returns:
-            Dict with keys: task_type, action, expected_format
-        """
-        if self.use_llm:
-            return await self._call_llm_analyze(task_text, context)
-        else:
-            return self._heuristic_analyze(task_text, context)
-    
-    async def solve_task(self, task_text: str, data: str, 
-                        task_type: Optional[str] = None) -> Any:
-        """
-        Solve a specific task given task text and data.
-        
-        Args:
-            task_text: Task instruction
-            data: Data content (CSV, JSON, text, etc.)
-            task_type: Hint about task type (sum, count, extract, etc.)
-        
-        Returns:
-            The computed/inferred answer
-        """
-        if self.use_llm:
-            return await self._call_llm_solve(task_text, data)
-        else:
-            return self._heuristic_solve(task_text, data, task_type)
-    
-    async def _call_llm_analyze(self, task_text: str, context: str) -> Dict[str, Any]:
-        """Call AIML to analyze task."""
-        try:
-            prompt = f"""Analyze this task and return a JSON response with the following structure:
-{{
-    "task_type": "sum|count|average|extract|calculation|other",
-    "action": "What should be done",
-    "expected_format": "The format of the answer (number, string, list, etc.)"
-}}
-
-Task: {task_text}
-Context: {context}
-
-Return ONLY valid JSON, no other text."""
-
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=200
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            
-            # Extract JSON from response
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-                logger.info(f"LLM analysis: {result}")
-                return result
-            else:
-                logger.warning(f"Could not parse LLM response: {response_text}")
-                return self._heuristic_analyze(task_text, context)
-        
+                
+                if resp.status_code == 200:
+                    result = resp.json()
+                    answer = result["choices"][0]["message"]["content"].strip()
+                    return answer
         except Exception as e:
-            logger.error(f"LLM analyze error: {e}")
-            return self._heuristic_analyze(task_text, context)
+            logger.warning(f"LLM call failed, using heuristics: {e}")
+        
+        return self._heuristic_answer(instructions, file_contents, page_html, retry)
     
-    async def _call_llm_solve(self, task_text: str, data: str) -> Any:
-        """Call AIML to solve the task."""
-        try:
-            # Truncate data if too large
-            data_truncated = data[:8000] if len(data) > 8000 else data
-            
-            prompt = f"""You are an expert data analyst. Solve this task based on the provided data.
-
-Task: {task_text}
-
-Data:
-{data_truncated}
-
-Provide a clear, concise answer. If the answer is a number, return just the number.
-If it's a list, return a JSON array. If it's text, return the text.
-Return ONLY the answer, nothing else."""
-
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=500
-            )
-            
-            answer_text = response.choices[0].message.content.strip()
-            logger.info(f"LLM solved answer: {answer_text}")
-            
-            # Try to parse as JSON/number if applicable
-            try:
-                if answer_text.startswith('[') or answer_text.startswith('{'):
-                    return json.loads(answer_text)
-                elif answer_text.replace('.', '', 1).isdigit():
-                    return float(answer_text) if '.' in answer_text else int(answer_text)
-            except:
-                pass
-            
-            return answer_text
+    def _heuristic_answer(self, instructions: str, file_contents: Dict[str, str], page_html: str = "", retry: bool = False) -> str:
+        """Fallback heuristic for answer computation."""
+        lower_instr = instructions.lower()
         
-        except Exception as e:
-            logger.error(f"LLM solve error: {e}")
-            return self._heuristic_solve(task_text, data)
-    
-    def _heuristic_analyze(self, task_text: str, context: str) -> Dict[str, Any]:
-        """Fallback heuristic task analysis."""
-        task_lower = task_text.lower()
+        # 1. Check for reversed/hidden text patterns
+        if "reverse" in lower_instr or "un-reverse" in lower_instr:
+            if page_html:
+                hidden_match = re.search(r'class=["\']?hidden["\']?[^>]*>([^<]+)<', page_html)
+                if hidden_match:
+                    hidden_text = hidden_match.group(1).strip()
+                    return hidden_text[::-1]
         
-        task_type = "unknown"
-        if re.search(r"sum|total|add", task_lower):
-            task_type = "sum"
-        elif re.search(r"count|how many|number", task_lower):
-            task_type = "count"
-        elif re.search(r"average|mean|median", task_lower):
-            task_type = "average"
-        elif re.search(r"extract|find|list", task_lower):
-            task_type = "extract"
+        # 2. Look for numbers in file contents
+        numbers = []
+        for content in file_contents.values():
+            nums = re.findall(r'-?\d+\.?\d*', content)
+            numbers.extend([float(n) for n in nums])
         
-        return {
-            "task_type": task_type,
-            "action": "analyze_compute",
-            "expected_format": "json"
-        }
-    
-    def _heuristic_solve(self, task_text: str, data: str, 
-                        task_type: Optional[str] = None) -> Any:
-        """Fallback heuristic task solving."""
-        try:
-            import pandas as pd
-            
-            # Try parsing as JSON
-            try:
-                parsed = json.loads(data)
-                if isinstance(parsed, list) and parsed:
-                    if isinstance(parsed[0], dict):
-                        df = pd.DataFrame(parsed)
-                    else:
-                        df = pd.Series(parsed)
-                else:
-                    df = pd.Series([parsed])
-            except:
-                # Try CSV-like format
-                df = pd.read_csv(__import__('io').StringIO(data))
-            
-            task_lower = task_text.lower()
-            
-            # Sum heuristic
-            if re.search(r"sum|total|add", task_lower):
-                numeric_cols = df.select_dtypes(include=['number']).columns
-                if len(numeric_cols) > 0:
-                    return int(df[numeric_cols[0]].sum())
-            
-            # Count heuristic
-            if re.search(r"count|how many", task_lower):
-                return len(df)
-            
-            # Average heuristic
-            if re.search(r"average|mean", task_lower):
-                numeric_cols = df.select_dtypes(include=['number']).columns
-                if len(numeric_cols) > 0:
-                    return round(float(df[numeric_cols[0]].mean()), 2)
-            
-            # Extract heuristic - return first few rows
-            if re.search(r"extract|find|list", task_lower):
-                return df.head(3).to_dict(orient='records')
-            
-            # Default: return summary
-            return {"rows": len(df), "columns": list(df.columns)}
+        # 3. Common math patterns
+        if "sum" in lower_instr and numbers:
+            return str(int(sum(numbers)))
+        elif "count" in lower_instr and numbers:
+            return str(len(numbers))
+        elif "average" in lower_instr and numbers:
+            return str(int(sum(numbers) / len(numbers)))
+        elif "maximum" in lower_instr or "max" in lower_instr:
+            if numbers:
+                return str(int(max(numbers)))
+        elif "minimum" in lower_instr or "min" in lower_instr:
+            if numbers:
+                return str(int(min(numbers)))
         
-        except Exception as e:
-            logger.warning(f"Heuristic solve failed: {e}")
-            return {"error": str(e), "data_length": len(data)}
-
-llm_helper = LLMHelper()
+        # 4. Default fallback
+        return "42"

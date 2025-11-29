@@ -1,389 +1,538 @@
-import asyncio
-import json
-import logging
-import time
+# === solver.py (UPDATED) ===
+import os
 import re
-import base64
+import json
+import asyncio
+import logging
 import tempfile
-from pathlib import Path
-from typing import Optional, Dict, Any
+import shutil
+import base64
 from datetime import datetime
-import uuid
+from pathlib import Path
+from typing import Optional, Dict, Any, Union
+from urllib.parse import urljoin
 
-from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
 import httpx
 import pandas as pd
-import pdfplumber
+from playwright.async_api import async_playwright
 
-from config import (
-    TEMP_DIR, TIMEOUT_SECONDS, BROWSER_TIMEOUT_MS, 
-    NETWORK_IDLE_TIMEOUT_MS, MAX_FILE_SIZE_BYTES, MAX_SUBMISSION_SIZE,
-    ALLOWED_SCHEMES
-)
-from llm_helper import llm_helper
+from llm_helper import LLMHelper
 
 logger = logging.getLogger(__name__)
 
 class QuizSolver:
-    """Main solver orchestrator."""
-    
-    def __init__(self, task_id: str):
-        self.task_id = task_id
-        self.start_time = time.time()
-        self.browser: Optional[Browser] = None
-        self.client = httpx.AsyncClient(timeout=30)
-        self.temp_files = []
-    
-    async def solve(self, email: str, url: str, secret: str) -> Dict[str, Any]:
-        """Main solve routine with 3-minute timeout enforcement."""
-        try:
-            logger.info(f"[{self.task_id}] Starting solve for {email} at {url}")
+    def __init__(self, request_id: str, email: str, secret: str, start_time: datetime, timeout_seconds: int):
+        self.request_id = request_id
+        self.email = email
+        self.secret = secret
+        self.start_time = start_time
+        self.timeout_seconds = timeout_seconds
+        self.temp_dir = tempfile.mkdtemp(prefix=f"quiz_{request_id}_")
+        self.llm_helper = LLMHelper()
+        self.max_file_size = 5 * 1024 * 1024  # 5MB
+        self.max_payload_size = 1 * 1024 * 1024  # 1MB
+        self.submission_attempts = {}  # Track attempts per URL
+        
+    def __del__(self):
+        """Cleanup temp directory."""
+        if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
             
-            result = await self._solve_loop(email, url, secret)
-            
-            elapsed = time.time() - self.start_time
-            logger.info(f"[{self.task_id}] Completed in {elapsed:.1f}s: {result}")
-            return result
-        
-        except Exception as e:
-            logger.error(f"[{self.task_id}] Solve failed: {e}", exc_info=True)
-            return {"status": "failed", "error": str(e)}
-        
-        finally:
-            await self.cleanup()
+    def _time_remaining(self) -> float:
+        """Get remaining time in seconds."""
+        elapsed = (datetime.now() - self.start_time).total_seconds()
+        return max(0, self.timeout_seconds - elapsed)
     
-    async def _solve_loop(self, email: str, url: str, secret: str) -> Dict[str, Any]:
-        """Loop through URLs until completion or timeout."""
-        current_url = url
-        submission_count = 0
+    def _is_timeout(self) -> bool:
+        """Check if timeout exceeded."""
+        return self._time_remaining() <= 0
+    
+    async def solve(self, initial_url: str) -> Dict[str, Any]:
+        """Main solver routine - solve quizzes following next URLs."""
+        current_url = initial_url
+        attempts = 0
+        max_attempts = 10
+        status = "completed"
+        failure_reason = None
         
-        while current_url and submission_count < 10:  # Safety limit
-            if self._time_expired():
-                logger.warning(f"[{self.task_id}] Timeout reached")
-                return {"status": "timeout"}
+        while current_url and attempts < max_attempts and not self._is_timeout():
+            attempts += 1
+            logger.info(f"[{self.request_id}] Attempt {attempts}: Solving {current_url}")
+            
+            if self._is_timeout():
+                logger.warning(f"[{self.request_id}] Timeout reached after {attempts-1} attempts")
+                status = "timeout"
+                break
             
             try:
-                # Fetch and render page
-                page_data = await self._fetch_and_parse_page(current_url)
-                logger.info(f"[{self.task_id}] Parsed page: {page_data}")
+                task_data = await self._extract_task(current_url)
+                if not task_data:
+                    logger.error(f"[{self.request_id}] Failed to extract task from {current_url}")
+                    status = "failed"
+                    failure_reason = "Failed to extract task"
+                    break
                 
-                # Extract task and submission details
-                task_text = page_data.get("task_text", "")
-                submit_url = page_data.get("submit_url")
-                submit_schema = page_data.get("submit_schema", {})
-                
-                if not submit_url:
-                    logger.error(f"[{self.task_id}] No submit URL found")
-                    return {"status": "failed", "error": "No submit URL"}
-                
-                # Solve the task
-                answer = await self._solve_task(task_text, page_data, email, secret)
-                
-                # Build submission payload
-                payload = self._build_payload(answer, email, secret, submit_schema)
-                
-                # Submit answer
-                submission_count += 1
-                response = await self._submit_answer(submit_url, payload)
-                logger.info(f"[{self.task_id}] Submission {submission_count}: {response}")
-                
-                # Check if correct and follow next URL
-                if response.get("correct"):
-                    next_url = response.get("url")
-                    if next_url:
-                        current_url = next_url
-                        logger.info(f"[{self.task_id}] Correct! Following next URL: {next_url}")
+                # Check if submit URL is available
+                if not task_data.get("submit_url"):
+                    # If no submit URL found, this might be a results page
+                    page_text = task_data.get("task_text", "")
+                    if "congratulations" in page_text.lower() or "completed" in page_text.lower() or "success" in page_text.lower():
+                        logger.info(f"[{self.request_id}] Quiz appears to be completed (results page)")
+                        status = "success"
+                        break
                     else:
-                        logger.info(f"[{self.task_id}] Correct! Quiz completed.")
-                        return {"status": "success", "final_response": response}
+                        logger.error(f"[{self.request_id}] No submit URL found - cannot proceed")
+                        logger.debug(f"[{self.request_id}] Page content: {page_text[:500]}")
+                        status = "failed"
+                        failure_reason = "No submit URL found in page"
+                        break
+                
+                answer = await self._compute_answer(task_data)
+                if not answer:
+                    logger.error(f"[{self.request_id}] Failed to compute answer")
+                    status = "failed"
+                    failure_reason = "Failed to compute answer"
+                    break
+                
+                logger.info(f"[{self.request_id}] Computed answer: {answer}")
+                
+                # Convert answer to proper format
+                formatted_answer = self._format_answer(answer)
+                
+                result = await self._submit_answer(task_data, formatted_answer)
+                if not result:
+                    logger.warning(f"[{self.request_id}] Submission failed")
+                    status = "failed"
+                    failure_reason = "Submission request failed"
+                    break
+                
+                logger.info(f"[{self.request_id}] Submit response: {result}")
+                
+                # Check if correct
+                if result.get("correct"):
+                    logger.info(f"[{self.request_id}] Answer correct!")
+                    if result.get("url"):
+                        current_url = result["url"]
+                        logger.info(f"[{self.request_id}] Following next URL: {current_url}")
+                    else:
+                        logger.info(f"[{self.request_id}] Quiz completed!")
+                        status = "success"
+                        break
                 else:
-                    # Try to improve answer and resubmit
-                    logger.warning(f"[{self.task_id}] Incorrect answer, will retry if time permits")
-                    await asyncio.sleep(1)
-            
+                    # Wrong answer - try to improve and re-submit
+                    logger.warning(f"[{self.request_id}] Answer incorrect: {result.get('reason')}")
+                    
+                    # Try to re-submit with different answer if time permits
+                    if self._time_remaining() > 30:
+                        improved_answer = await self._compute_answer(task_data, retry=True)
+                        if improved_answer and improved_answer != answer:
+                            logger.info(f"[{self.request_id}] Re-submitting with improved answer: {improved_answer}")
+                            formatted_answer = self._format_answer(improved_answer)
+                            result = await self._submit_answer(task_data, formatted_answer)
+                            if result and result.get("correct"):
+                                if result.get("url"):
+                                    current_url = result["url"]
+                                    logger.info(f"[{self.request_id}] Following next URL: {current_url}")
+                                else:
+                                    status = "success"
+                                    break
+                            elif result and result.get("url"):
+                                # Move to next URL even if wrong
+                                current_url = result["url"]
+                                logger.info(f"[{self.request_id}] Following provided next URL: {current_url}")
+                            else:
+                                status = "failed"
+                                failure_reason = "Wrong answer and no next URL provided"
+                                break
+                        else:
+                            # Check if new URL provided
+                            if result.get("url"):
+                                current_url = result["url"]
+                                logger.info(f"[{self.request_id}] Following provided next URL: {current_url}")
+                            else:
+                                status = "failed"
+                                failure_reason = "Wrong answer, no improvement possible"
+                                break
+                    else:
+                        logger.warning(f"[{self.request_id}] Insufficient time for re-submission")
+                        status = "failed"
+                        failure_reason = "Insufficient time to retry"
+                        break
+                    
             except Exception as e:
-                logger.error(f"[{self.task_id}] Error in solve loop: {e}", exc_info=True)
-                return {"status": "failed", "error": str(e)}
+                logger.error(f"[{self.request_id}] Error in solve loop: {e}", exc_info=True)
+                status = "failed"
+                failure_reason = str(e)
+                break
         
-        return {"status": "completed", "submissions": submission_count}
-    
-    async def _fetch_and_parse_page(self, url: str) -> Dict[str, Any]:
-        """Load page with Playwright and extract task/submit details."""
-        if not self._is_safe_url(url):
-            raise ValueError(f"Unsafe URL: {url}")
-        
-        if self.browser is None:
-            self.browser = await self._init_browser()
-        
-        context = await self.browser.new_context()
-        page = await context.new_page()
-        
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=BROWSER_TIMEOUT_MS)
-            await asyncio.sleep(1)  # Extra stability wait
-            
-            # Extract page content
-            page_data = await self._extract_page_data(page)
-            
-            # Download and parse linked files
-            files_data = await self._download_and_parse_files(page)
-            page_data.update(files_data)
-            
-            return page_data
-        
-        finally:
-            await page.close()
-            await context.close()
-    
-    async def _extract_page_data(self, page: Page) -> Dict[str, Any]:
-        """Extract task text, submit URL, and schema from DOM."""
-        result = {
-            "task_text": "",
-            "submit_url": None,
-            "submit_schema": {},
-            "page_html": ""
+        return {
+            "request_id": self.request_id,
+            "attempts": attempts,
+            "status": status,
+            "reason": failure_reason,
+            "time_remaining": self._time_remaining()
         }
-        
+    
+    async def _extract_task(self, url: str) -> Optional[Dict[str, Any]]:
+        """Extract task info from quiz page using Playwright."""
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            
+            try:
+                logger.info(f"[{self.request_id}] Loading {url}")
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(2)  # Extra wait for JS rendering
+                
+                html_content = await page.content()
+                task_text = await self._extract_instructions(page)
+                submit_url = await self._extract_submit_url(page, html_content)
+                schema = await self._extract_schema(page, html_content)
+                files = await self._extract_and_download_files(page)
+                
+                task_data = {
+                    "url": url,
+                    "task_text": task_text,
+                    "page_html": html_content,
+                    "submit_url": submit_url,
+                    "submit_schema": schema,
+                    "files_data": files,
+                }
+                
+                logger.info(f"[{self.request_id}] Parsed page. Submit URL: {submit_url}")
+                if not submit_url:
+                    logger.debug(f"[{self.request_id}] Page title: {await page.title()}")
+                    logger.debug(f"[{self.request_id}] Page URL: {page.url}")
+                    logger.debug(f"[{self.request_id}] First 500 chars of task_text: {task_text[:500]}")
+                return task_data
+                
+            except Exception as e:
+                logger.error(f"[{self.request_id}] Error extracting task: {e}", exc_info=True)
+                return None
+            finally:
+                await context.close()
+                await browser.close()
+    
+    async def _extract_instructions(self, page) -> str:
+        """Extract visible task instructions from page."""
         try:
-            # Get page HTML
-            html = await page.content()
-            result["page_html"] = html
+            # First try getting text content
+            text = await page.inner_text("body")
+            if text and len(text.strip()) > 10:
+                return text[:3000]
             
-            # Extract task text (look for main content)
-            task_text = await page.evaluate("""() => {
-                let text = document.body.innerText;
-                return text.substring(0, 2000);
-            }""")
-            result["task_text"] = task_text
+            # If no text (canvas-based content), extract from page source/scripts
+            html_content = await page.content()
             
-            # Try to find submit URL from script tags (look for JSON config)
+            # Look for instructions in script tags
+            script_matches = re.findall(r'(?:const|let|var)\s+(?:lines|instructions|task|puzzle)?\s*=\s*\[([\s\S]*?)\];', html_content, re.IGNORECASE)
+            if script_matches:
+                instructions = script_matches[0]
+                # Clean up and return
+                return instructions[:3000]
+            
+            # Look for console.log statements that describe the task
+            log_matches = re.findall(r'console\.log\s*\(\s*{([^}]+)}\s*\)', html_content)
+            if log_matches:
+                return log_matches[0][:3000]
+            
+            # Fall back to HTML
+            return html_content[:3000]
+        except:
+            return ""
+    
+    async def _extract_submit_url(self, page, html_content: str = "") -> Optional[str]:
+        """Extract submit endpoint from page."""
+        try:
+            # Get current page URL to derive submit endpoint
+            current_url = str(page.url)
+            base_url = current_url.rsplit('/', 1)[0]  # Get base URL
+            domain = '/'.join(current_url.split('/')[:3])  # Get domain
+            
+            # 1. Look for forms with action attribute
+            forms = await page.query_selector_all("form")
+            if forms:
+                action = await forms[0].get_attribute("action")
+                if action:
+                    url = urljoin(current_url, action)
+                    logger.info(f"[{self.request_id}] Found submit URL in form: {url}")
+                    return url
+            
+            # 2. Look in scripts for POST endpoints (fetch/axios/jQuery)
             scripts = await page.query_selector_all("script")
             for script in scripts:
+                content = await script.inner_text()
+                
+                # Match various patterns: fetch(...), $.post(...), axios.post(...)
+                patterns = [
+                    r'(?:fetch|post)\s*\(\s*["\']?(https?://[^\s"\'\)]+)',
+                    r'(?:fetch|post)\s*\(\s*["\']?(https?://[^\s"\'\,]+)',
+                    r'url\s*:\s*["\']?(https?://[^\s"\'\}]+)',
+                    r'endpoint\s*:\s*["\']?(https?://[^\s"\'\}]+)',
+                    r'action\s*:\s*["\']?(https?://[^\s"\'\}]+)',
+                    r'submit.*?url\s*:\s*["\']?(https?://[^\s"\'\}]+)',
+                ]
+                
+                for pattern in patterns:
+                    urls = re.findall(pattern, content, re.IGNORECASE)
+                    if urls:
+                        for url in urls:
+                            if url and len(url) < 300:
+                                logger.info(f"[{self.request_id}] Found submit URL in script: {url}")
+                                return url
+            
+            # 3. Look in HTML content for action attributes or data attributes
+            if html_content:
+                # Look for data-submit or data-url attributes
+                action_urls = re.findall(r'(?:data-submit|data-action|action)=["\']?(https?://[^\s"\']+)', html_content, re.IGNORECASE)
+                if action_urls:
+                    logger.info(f"[{self.request_id}] Found submit URL in HTML attributes: {action_urls[0]}")
+                    return action_urls[0]
+            
+            # 4. Look in page text for URLs with submit-like keywords
+            page_text = await page.inner_text("body")
+            urls = re.findall(r'https?://[^\s\n"\'<>]+', page_text)
+            if urls:
+                for url in urls:
+                    if any(x in url.lower() for x in ['/submit', '/api', '/answer', '/check', '/solve', '/process']):
+                        logger.info(f"[{self.request_id}] Found submit URL in page text: {url}")
+                        return url
+            
+            # 5. Look in hidden divs/elements
+            hidden_elements = await page.query_selector_all("[style*='display:none'], [hidden], .hidden, [data-submit]")
+            for elem in hidden_elements:
                 try:
-                    content = await script.text_content()
-                    if content:
-                        # Try to parse JSON from script
-                        json_match = re.search(r'\{.*?"submit".*?\}', content, re.DOTALL)
-                        if json_match:
-                            try:
-                                config = json.loads(json_match.group())
-                                if "submit" in config:
-                                    result["submit_url"] = config["submit"]
-                                    result["submit_schema"] = config.get("schema", {})
-                                    break
-                            except:
-                                pass
+                    text_content = await elem.inner_text()
+                    urls = re.findall(r'https?://[^\s\n"\'<>]+', text_content)
+                    if urls and any(x in urls[0].lower() for x in ['/submit', '/api']):
+                        logger.info(f"[{self.request_id}] Found submit URL in hidden element: {urls[0]}")
+                        return urls[0]
                 except:
                     pass
             
-            # Fallback: look for forms and links containing "submit"
-            if not result["submit_url"]:
-                forms = await page.query_selector_all("form")
-                for form in forms:
-                    action = await form.get_attribute("action")
-                    if action:
-                        result["submit_url"] = action
-                        break
+            # 6. Look in code/pre blocks
+            pre_tags = await page.query_selector_all("pre, code")
+            for tag in pre_tags:
+                content = await tag.inner_text()
+                urls = re.findall(r'https?://[^\s\n"\'<>]+', content)
+                if urls:
+                    for url in urls:
+                        if any(x in url.lower() for x in ['/submit', '/api', '/check', '/solve']):
+                            logger.info(f"[{self.request_id}] Found submit URL in pre/code: {url}")
+                            return url
             
-            # Fallback: look for data attributes or inline JSON
-            if not result["submit_url"]:
-                body_html = await page.inner_html("body")
-                # Look for Base64 JSON
-                b64_match = re.search(r'"([A-Za-z0-9+/=]{50,})"', body_html)
-                if b64_match:
-                    try:
-                        decoded = base64.b64decode(b64_match.group(1)).decode()
-                        config = json.loads(decoded)
-                        if "submit" in config:
-                            result["submit_url"] = config["submit"]
-                    except:
-                        pass
-        
+            # 7. Extract all URLs and look for the most likely submit endpoint
+            if page_text:
+                all_urls = re.findall(r'https?://[^\s\n"\'<>]+', page_text)
+                if all_urls:
+                    # Prefer URLs from the same domain as the current page
+                    current_domain = str(page.url).split('/')[2]
+                    domain_urls = [u for u in all_urls if current_domain in u]
+                    if domain_urls:
+                        logger.info(f"[{self.request_id}] Found domain-matching URL: {domain_urls[0]}")
+                        return domain_urls[0]
+                    
+                    # If no domain match, take first HTTPS URL
+                    https_urls = [u for u in all_urls if u.startswith('https')]
+                    if https_urls:
+                        logger.info(f"[{self.request_id}] Found HTTPS URL: {https_urls[0]}")
+                        return https_urls[0]
+            
+            # 8. Last resort: Assume /submit endpoint on same domain
+            # This is based on the spec which says pages "always include submit URL"
+            # If we can't find it explicitly, assume it's the standard /submit endpoint
+            assumed_submit_url = f"{domain}/submit"
+            logger.info(f"[{self.request_id}] No explicit submit URL found, assuming: {assumed_submit_url}")
+            return assumed_submit_url
+            
         except Exception as e:
-            logger.warning(f"Error extracting page data: {e}")
-        
-        return result
-    
-    async def _download_and_parse_files(self, page: Page) -> Dict[str, Any]:
-        """Find and download linked files (PDF, CSV, images)."""
-        result = {"files_data": {}, "errors": []}
-        
-        try:
-            links = await page.query_selector_all("a[href]")
-            for link in links[:5]:  # Limit to 5 files
-                try:
-                    href = await link.get_attribute("href")
-                    if href and any(href.endswith(ext) for ext in ['.pdf', '.csv', '.json', '.xlsx', '.png', '.jpg']):
-                        file_data = await self._download_file(href)
-                        if file_data:
-                            result["files_data"][href] = file_data
-                except:
-                    pass
-        
-        except Exception as e:
-            logger.warning(f"Error downloading files: {e}")
-        
-        return result
-    
-    async def _download_file(self, url: str) -> Optional[Dict[str, Any]]:
-        """Download and parse a file."""
-        try:
-            # Make absolute URL if relative
-            if url.startswith('/'):
-                url = self._resolve_relative_url(url)
-            
-            response = await self.client.get(url)
-            response.raise_for_status()
-            
-            content = response.content
-            if len(content) > MAX_FILE_SIZE_BYTES:
-                logger.warning(f"File too large: {url}")
-                return None
-            
-            filename = Path(url).name or f"file_{uuid.uuid4().hex[:8]}"
-            temp_path = TEMP_DIR / filename
-            temp_path.write_bytes(content)
-            self.temp_files.append(temp_path)
-            
-            # Parse based on extension
-            ext = Path(url).suffix.lower()
-            data = None
-            
-            if ext == '.pdf':
-                data = self._parse_pdf(temp_path)
-            elif ext in ['.csv', '.xlsx']:
-                data = self._parse_csv(temp_path)
-            elif ext == '.json':
-                data = json.loads(content.decode())
-            elif ext in ['.png', '.jpg', '.jpeg']:
-                data = self._parse_image(temp_path)
-            
-            return {"filename": filename, "data": data, "size": len(content)}
-        
-        except Exception as e:
-            logger.warning(f"Error downloading file {url}: {e}")
+            logger.error(f"[{self.request_id}] Error extracting submit URL: {e}", exc_info=True)
             return None
     
-    def _parse_pdf(self, path: Path) -> str:
-        """Extract text from PDF."""
+    async def _extract_schema(self, page, html_content: str = "") -> Dict[str, Any]:
+        """Extract submission schema from page."""
         try:
-            with pdfplumber.open(path) as pdf:
-                text = ""
-                for page in pdf.pages:
-                    text += page.extract_text() + "\n"
-                return text[:5000]  # Limit output
-        except Exception as e:
-            logger.warning(f"PDF parse error: {e}")
-            return ""
-    
-    def _parse_csv(self, path: Path) -> Any:
-        """Parse CSV to list of dicts."""
-        try:
-            df = pd.read_csv(path)
-            return df.head(20).to_dict(orient='records')
-        except Exception as e:
-            logger.warning(f"CSV parse error: {e}")
-            return {}
-    
-    def _parse_image(self, path: Path) -> str:
-        """Extract text from image using OCR."""
-        try:
-            import pytesseract
-            from PIL import Image
-            img = Image.open(path)
-            text = pytesseract.image_to_string(img)
-            return text[:1000]
-        except Exception as e:
-            logger.warning(f"Image OCR error: {e}")
-            return ""
-    
-    async def _solve_task(self, task_text: str, page_data: Dict[str, Any],
-                         email: str, secret: str) -> Any:
-        """Analyze and solve the task using LLM."""
-        try:
-            # Collect context
-            context = f"Files: {list(page_data.get('files_data', {}).keys())}"
+            scripts = await page.query_selector_all("script")
+            for script in scripts:
+                content = await script.inner_text()
+                if '"email"' in content and '"answer"' in content:
+                    try:
+                        json_str = content[max(0, content.find('{')):]
+                        json_obj = json.loads(json_str[:json_str.find('}')+1])
+                        return json_obj
+                    except:
+                        pass
             
-            # Analyze task using AIML
-            analysis = await llm_helper.analyze_task(task_text, context)
-            logger.info(f"[{self.task_id}] Task analysis: {analysis}")
+            if html_content and '"email"' in html_content:
+                match = re.search(r'\{[^{}]*"email"[^{}]*\}', html_content)
+                if match:
+                    try:
+                        return json.loads(match.group(0))
+                    except:
+                        pass
             
-            # Extract data for solving
-            data_str = json.dumps(page_data.get('files_data', {}), default=str)
-            
-            # Solve using AIML
-            answer = await llm_helper.solve_task(task_text, data_str, analysis.get('task_type'))
-            logger.info(f"[{self.task_id}] Answer from AIML: {answer}")
-            return answer
-        
-        except Exception as e:
-            logger.error(f"[{self.task_id}] Solve task error: {e}")
-            return {"error": str(e)}
-    
-    def _build_payload(self, answer: Any, email: str, secret: str, 
-                      schema: Dict[str, Any]) -> Dict[str, Any]:
-        """Build submission payload matching expected schema."""
-        payload = {
-            "email": email,
-            "secret": secret,
-            "answer": answer
-        }
-        
-        # Validate size
-        payload_json = json.dumps(payload, default=str)
-        if len(payload_json.encode()) > MAX_SUBMISSION_SIZE:
-            logger.warning(f"Payload too large, truncating")
-            answer_str = str(answer)[:100]
-            payload["answer"] = answer_str
-        
-        return payload
-    
-    async def _submit_answer(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST answer to submit URL."""
-        try:
-            if not self._is_safe_url(url):
-                raise ValueError(f"Unsafe submit URL: {url}")
-            
-            response = await self.client.post(url, json=payload)
-            response.raise_for_status()
-            return response.json()
-        
-        except Exception as e:
-            logger.error(f"[{self.task_id}] Submission error: {e}")
-            return {"correct": False, "error": str(e)}
-    
-    def _time_expired(self) -> bool:
-        """Check if 3 minutes have elapsed."""
-        return (time.time() - self.start_time) > TIMEOUT_SECONDS
-    
-    def _is_safe_url(self, url: str) -> bool:
-        """Validate URL to prevent SSRF."""
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            return parsed.scheme in ALLOWED_SCHEMES
+            return {"email": "", "secret": "", "url": "", "answer": ""}
         except:
-            return False
+            return {"email": "", "secret": "", "url": "", "answer": ""}
     
-    def _resolve_relative_url(self, relative: str) -> str:
-        """Resolve relative URLs (simplified)."""
-        return relative  # In production, track base URL from page
-    
-    async def _init_browser(self) -> Browser:
-        """Initialize Playwright browser."""
-        playwright = await async_playwright().start()
-        return await playwright.chromium.launch(headless=True)
-    
-    async def cleanup(self):
-        """Clean up resources."""
+    async def _extract_and_download_files(self, page) -> Dict[str, str]:
+        """Download files from page links."""
+        files = {}
         try:
-            if self.browser:
-                await self.browser.close()
-            await self.client.aclose()
-            for temp_file in self.temp_files:
+            async with httpx.AsyncClient() as client:
+                links = await page.query_selector_all("a[href]")
+                for link in links[:10]:
+                    if self._is_timeout():
+                        break
+                        
+                    href = await link.get_attribute("href")
+                    if not href:
+                        continue
+                    
+                    file_url = urljoin(str(page.url), href)
+                    if any(file_url.lower().endswith(ext) for ext in ['.pdf', '.csv', '.json', '.txt', '.png', '.jpg', '.xlsx']):
+                        try:
+                            resp = await client.get(file_url, timeout=15, follow_redirects=True)
+                            if resp.status_code == 200 and len(resp.content) < self.max_file_size:
+                                file_path = os.path.join(self.temp_dir, Path(file_url).name)
+                                with open(file_path, 'wb') as f:
+                                    f.write(resp.content)
+                                files[Path(file_url).name] = file_path
+                                logger.info(f"[{self.request_id}] Downloaded {Path(file_url).name}")
+                        except Exception as e:
+                            logger.debug(f"[{self.request_id}] Failed to download {file_url}: {e}")
+        except Exception as e:
+            logger.debug(f"[{self.request_id}] Error extracting files: {e}")
+        
+        return files
+    
+    async def _compute_answer(self, task_data: Dict[str, Any], retry: bool = False) -> Optional[Union[str, int, float, bool, dict]]:
+        """Compute answer - can be string, number, boolean, or JSON."""
+        try:
+            task_text = task_data.get("task_text", "")
+            page_html = task_data.get("page_html", "")
+            files = task_data.get("files_data", {})
+            
+            # Look for hidden elements
+            hidden_match = re.search(r'class=["\']?hidden["\']?[^>]*>([^<]+)<', page_html)
+            if hidden_match:
+                hidden_text = hidden_match.group(1).strip()
+                logger.info(f"[{self.request_id}] Found hidden element: {hidden_text}")
+                
+                if "reverse" in task_text.lower() or "un-reverse" in task_text.lower():
+                    return hidden_text[::-1]
+                return hidden_text
+            
+            # Parse file contents
+            file_contents = {}
+            for filename, filepath in files.items():
                 try:
-                    temp_file.unlink()
+                    if filename.endswith('.csv'):
+                        df = pd.read_csv(filepath)
+                        file_contents[filename] = df.to_string()
+                    elif filename.endswith('.json'):
+                        with open(filepath) as f:
+                            file_contents[filename] = json.dumps(json.load(f), indent=2)
+                    elif filename.endswith('.xlsx'):
+                        df = pd.read_excel(filepath)
+                        file_contents[filename] = df.to_string()
+                    else:
+                        with open(filepath, 'r', errors='ignore') as f:
+                            file_contents[filename] = f.read(2000)
+                except Exception as e:
+                    logger.debug(f"[{self.request_id}] Error parsing {filename}: {e}")
+            
+            # Use LLM to compute answer
+            answer = await self.llm_helper.compute_answer(
+                instructions=task_text,
+                file_contents=file_contents,
+                page_html=page_html,
+                retry=retry
+            )
+            
+            return answer
+        except Exception as e:
+            logger.error(f"[{self.request_id}] Error computing answer: {e}", exc_info=True)
+            return None
+    
+    def _format_answer(self, answer: Any) -> Any:
+        """Format answer to proper type (number, string, boolean, JSON)."""
+        if answer is None:
+            return ""
+        
+        # Try to parse as number
+        if isinstance(answer, str):
+            # Try int
+            try:
+                return int(answer)
+            except:
+                pass
+            
+            # Try float
+            try:
+                return float(answer)
+            except:
+                pass
+            
+            # Check for boolean
+            if answer.lower() in ['true', 'yes']:
+                return True
+            if answer.lower() in ['false', 'no']:
+                return False
+            
+            # Try JSON
+            if answer.strip().startswith('{') or answer.strip().startswith('['):
+                try:
+                    return json.loads(answer)
                 except:
                     pass
+            
+            # Return as string
+            return answer
+        
+        return answer
+    
+    async def _submit_answer(self, task_data: Dict[str, Any], answer: Any) -> Optional[Dict[str, Any]]:
+        """Submit answer to quiz endpoint."""
+        submit_url = task_data.get("submit_url")
+        if not submit_url:
+            # This should not happen now, but keep as safety check
+            logger.error(f"[{self.request_id}] No submit URL in task data")
+            return None
+        
+        schema = task_data.get("submit_schema", {})
+        payload = {}
+        
+        if "email" in schema or not schema:
+            payload["email"] = self.email
+        if "secret" in schema or not schema:
+            payload["secret"] = self.secret
+        if "url" in schema:
+            payload["url"] = task_data.get("url", "")
+        if "answer" in schema or not schema:
+            payload["answer"] = answer
+        
+        payload_json = json.dumps(payload)
+        if len(payload_json.encode()) > self.max_payload_size:
+            logger.error(f"[{self.request_id}] Payload too large: {len(payload_json.encode())} bytes")
+            return None
+        
+        try:
+            logger.info(f"[{self.request_id}] Submitting to {submit_url}")
+            logger.info(f"[{self.request_id}] Payload: {payload}")
+            
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(submit_url, json=payload)
+                logger.info(f"[{self.request_id}] Submit response status: {resp.status_code}")
+                logger.info(f"[{self.request_id}] Submit response body: {resp.text[:500]}")
+                
+                if resp.status_code == 200:
+                    try:
+                        return resp.json()
+                    except:
+                        return {"correct": False}
+                return None
         except Exception as e:
-            logger.warning(f"Cleanup error: {e}")
+            logger.error(f"[{self.request_id}] Error submitting answer: {e}", exc_info=True)
+            return None

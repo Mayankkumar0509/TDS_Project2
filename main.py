@@ -1,98 +1,94 @@
-import logging
+import os
 import json
 import uuid
-from typing import Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status
+import logging
+from datetime import datetime
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import asyncio
 
-from config import QUIZ_SECRET, LOG_LEVEL, LOGS_DIR
 from solver import QuizSolver
 
 # Setup logging
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOGS_DIR / 'solver.log'),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LLM Quiz Solver API", version="1.0.0")
+app = FastAPI(title="LLM Analysis Quiz Solver")
 
 class SolveRequest(BaseModel):
     email: str
     secret: str
     url: str
 
-class ErrorResponse(BaseModel):
-    error: str
-    status_code: int
-
-class SuccessResponse(BaseModel):
-    status: str
-    task_id: str
-
-# In-memory task tracking (in production, use database)
-active_tasks = {}
-
-@app.post("/solve", response_model=SuccessResponse)
+@app.post("/solve")
 async def solve(request: SolveRequest, background_tasks: BackgroundTasks):
-    """
-    Receive a quiz task, verify secret, and start async solver.
+    """Endpoint to submit a quiz task for solving."""
+    request_id = str(uuid.uuid4())
     
-    Returns HTTP 200 immediately with task_id.
-    Solver runs in background with 3-minute timeout.
-    """
-    # Validate request
+    # Validate required fields
     if not request.email or not request.secret or not request.url:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required fields: email, secret, url"
-        )
+        logger.warning(f"[{request_id}] Missing required fields")
+        raise HTTPException(status_code=400, detail="Missing required fields: email, secret, url")
     
     # Verify secret
-    if request.secret != QUIZ_SECRET:
-        logger.warning(f"Invalid secret provided for {request.email}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid secret"
-        )
+    quiz_secret = os.getenv("QUIZ_SECRET", "")
+    if request.secret != quiz_secret:
+        logger.warning(f"[{request_id}] Invalid secret provided")
+        raise HTTPException(status_code=403, detail="Invalid secret")
     
-    # Generate task ID
-    task_id = str(uuid.uuid4())
+    # Validate URL format
+    if not request.url.startswith("http://") and not request.url.startswith("https://"):
+        logger.warning(f"[{request_id}] Invalid URL scheme")
+        raise HTTPException(status_code=400, detail="URL must be http or https")
     
-    # Schedule solver in background
-    background_tasks.add_task(_run_solver, task_id, request.email, request.url, request.secret)
+    logger.info(f"[{request_id}] Valid request accepted. Email: {request.email}, URL: {request.url}")
     
-    logger.info(f"Task {task_id} scheduled for {request.email} at {request.url}")
+    # Start solver in background
+    background_tasks.add_task(
+        _run_solver,
+        request_id=request_id,
+        email=request.email,
+        url=request.url,
+        secret=request.secret
+    )
     
-    return {
-        "status": "accepted",
-        "task_id": task_id
-    }
+    return JSONResponse(status_code=200, content={"status": "accepted", "request_id": str(request_id)})
 
-async def _run_solver(task_id: str, email: str, url: str, secret: str):
-    """Background task to run solver."""
-    solver = QuizSolver(task_id)
-    result = await solver.solve(email, url, secret)
-    active_tasks[task_id] = result
+async def _run_solver(request_id: str, email: str, url: str, secret: str):
+    """Run the solver in background with 3-minute timeout."""
+    start_time = datetime.now()
+    timeout_seconds = 180  # 3 minutes
+    
+    logger.info(f"[{request_id}] Starting solve for {email} at {url}")
+    
+    try:
+        solver = QuizSolver(
+            request_id=request_id,
+            email=email,
+            secret=secret,
+            start_time=start_time,
+            timeout_seconds=timeout_seconds
+        )
+        result = await asyncio.wait_for(
+            solver.solve(url),
+            timeout=timeout_seconds + 5
+        )
+        logger.info(f"[{request_id}] Solver completed: {result}")
+    except asyncio.TimeoutError:
+        logger.warning(f"[{request_id}] Solver exceeded 3-minute timeout")
+    except Exception as e:
+        logger.error(f"[{request_id}] Solver error: {type(e).__name__}: {e}", exc_info=True)
 
 @app.get("/health")
 async def health():
     """Health check endpoint."""
     return {"status": "ok"}
 
-@app.get("/tasks/{task_id}")
-async def get_task_status(task_id: str):
-    """Get status of a background task."""
-    if task_id in active_tasks:
-        return {"task_id": task_id, "result": active_tasks[task_id]}
-    else:
-        return {"task_id": task_id, "status": "running or not found"}
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
