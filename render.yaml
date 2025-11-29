@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: llm-quiz-solver
+    env: docker
+    region: oregon  # Choose: oregon, frankfurt, singapore
+    plan: free  # Or: starter, standard, pro
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: QUIZ_SECRET
+        sync: false  # Set manually in Render dashboard
+      - key: AIML_BASE_URL
+        value: https://aipipe.org/openai/v1
+      - key: AIML_MODEL
+        value: gpt-4o-mini
+      - key: AIML_API_KEY
+        sync: false  # Set manually in Render dashboard
+      - key: MAX_FILE_SIZE_MB
+        value: 5
+      - key: TIMEOUT_SECONDS
+        value: 180
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
